@@ -1,0 +1,660 @@
+!<arch>
+cas_client.cpp/ 1483431591  0     0     100644  20273     `
+/*********************************************************************
+* 版权所有 (C)2016, 深圳市视维科技有限公司。
+*
+* 文件名称： casClient.cpp
+* 文件标识：
+* 内容摘要： cas认证组件源代码
+* 当前版本： 0.0.1
+* 作    者： 游绍萍
+* 完成日期： 2016年7月17日
+**********************************************************************/
+
+#include "../include/cas_client.h"
+#include "assert.h"
+casClient* casClient::m_pInstance = NULL;
+
+
+int casClient::readfile(Data *d,const char *cas_conf_file_name)
+{
+  assert(cas_conf_file_name!=NULL);
+  const char *FileName = cas_conf_file_name;
+  char LineBuf[MAX_LEN]={0};
+  FILE *configFile = fopen(FileName, "r");
+  if(configFile==NULL)
+  { 
+     cout<<"Open File:"<<cas_conf_file_name<<" failed!"<<endl;
+     return -1;  
+  }
+  m_info((char *)cas_conf_file_name);
+  memset(d,0,sizeof(Data));
+  while(NULL != fgets(LineBuf, sizeof(LineBuf), configFile))
+  {
+    size_t bufLen = strlen(LineBuf);
+    if('\r' == LineBuf[bufLen-2])
+    {
+    	LineBuf[bufLen-2] = '\0';
+    }
+    else
+    {
+    	LineBuf[bufLen-1] = '\0';
+    }
+    char *pos = strchr(LineBuf,':');
+    if(NULL != pos)
+    {
+      *pos = '\0';
+      pos++;
+      if(0 == strcmp(LineBuf, "address"))
+      {
+        for(; *pos == ' '; pos++){}
+
+        strcpy(d->address, pos);
+      }
+      else if(0 == strcmp(LineBuf, "timeout"))
+      {
+        for(; *pos == ' '; pos++){}
+
+        strcpy(d->timeout, pos);
+      }
+      else
+      {
+        m_error((char*)"Failed to read information from the file.");
+        fclose(configFile);
+        return -1;
+      }
+    }//if(NULL != pos)
+  }//while(NULL != fgets(LineBuf, sizeof(LineBuf), configFile))
+  fclose(configFile);
+  return 0;
+}
+/**********************************************************************
+ * @brief   初始化，做一些赋值
+ * @param 	s_address：redis连接地址;
+ * @param   i_timeout：连接超时时间(默认为3); 
+ * @return 	0：成功
+ ********************************************************************/
+int casClient::init(char* log_address,const char *cas_conf_file_name)
+{
+	//日志初始化
+    pthread_t  pth;
+    loginit(&pth,(char*)log_address,10);
+    //读取配置文件
+    int ret;
+    m_data = new Data;
+    ret = readfile(m_data, cas_conf_file_name);
+    if (-1 == ret)
+    {
+    	return -1;
+    }
+	m_address = m_data->address;
+	m_timeout = atoi(m_data->timeout);
+    char c_log[50] = {0};
+    snprintf(c_log,sizeof(c_log),"m_address = %s m_timeout = %d",m_address.c_str(),m_timeout);
+    m_info(c_log);
+
+    m_redis_connect = 0;
+    m_pctx = NULL;
+    return 0;
+}
+
+/**********************************************************************
+ * @brief   连接redis
+ * @param 
+ * @return 	成功返回0，失败返回-1
+ ********************************************************************/
+int casClient::connect()
+{
+	struct timeval timeoutVal;
+    timeoutVal.tv_sec  = 3;
+    timeoutVal.tv_usec = 0;
+	m_pctx = redisClusterConnectWithTimeout(m_address.c_str(), timeoutVal, HIRCLUSTER_FLAG_NULL);
+	if (m_pctx == NULL || m_pctx->err)
+	{
+		m_error((char*)"redisClusterConnectWithTimeout error");
+		if (NULL!=m_pctx)
+                {
+        	char c_log[50] = {0};
+    		snprintf(c_log,sizeof(c_log),"m_pctx->errstr = %s",m_pctx->errstr);
+    		m_error((char*)c_log);
+                redisClusterFree(m_pctx);
+                }
+		//printf("connect error :%s\n",m_pctx == NULL ? "NULL" : m_pctx->errstr );
+		return -1;
+	}
+	m_info((char*)"connect success");
+	return 0;
+}
+
+
+/**********************************************************************
+ * @brief   重新连接redis连接次数由
+ * @param 
+ * @return 	成功返回0，失败返回-1
+ ********************************************************************/
+int casClient::reconnect()
+{
+	if (m_redis_connect < REDIS_RECONNECT_INDEX)
+	{
+		if(0==this->connect())
+		{
+			m_info((char*)"reconnect success");
+			return 0;
+		}
+	}
+	m_warn((char*)"reconnect fail");
+	return -1;
+}
+
+/**********************************************************************
+ * @brief   string转换time_t，给最后保存时间进行类型转换
+ * @param 	string    (map里面存储的时间）
+ * @return  time_t l （转换好的可以进行计算的时间）
+ *********************************************************************/
+time_t casClient::str_to_t(string str)
+{
+    time_t result;
+    istringstream is(str); //使用构造函数，把str转化成输入流
+    //读取 istringstream 对象自动地将数值型数据的字符表示方式转换为相应的算术值
+    is >> result;
+    return result;
+}
+
+
+/**********************************************************************
+ * @brief   time_t转换string，用来记录最后操作时间时类型转换
+ * @param 	time_t t （本地时间的时间格式）
+ * @return  string    (转换好可以存储到map的字符格式)
+ *********************************************************************/
+string casClient::t_to_str(time_t t)
+{
+    ostringstream os;  //创建一个流
+    os<<t;			//把值传递到流中
+    string result;
+    istringstream is(os.str()); //使用构造函数，把os里面值转化成输入流
+    //读取 istringstream 对象自动地将数值型数据的字符表示方式转换为相应的算术值
+    is>>result;
+    return result;
+}
+
+/**********************************************************************
+ * @brief   保存最后操作时间（有就更新，没有添加）
+ * @param 	s_token    (全局唯一标识的token)
+ * @return  成功返回0
+ *********************************************************************/
+int casClient::set_last_time(string s_token)
+{
+	time_t rawtime;
+	time (&rawtime);
+	string s_rawtime;
+	s_rawtime = this->t_to_str(rawtime);
+
+	map<string ,string >::iterator l_it;
+	l_it=m_last_time.find(s_token);
+
+    if(l_it==m_last_time.end())
+    {
+    	m_last_time.insert(pair<string,string>(s_token,s_rawtime));
+    }
+    else
+    {
+    	l_it->second = s_rawtime;
+    }
+    m_info((char*)"set_last_time success");
+    return 0;
+}
+
+/**********************************************************************
+ * @brief   保存resource资源树
+ * @param 	s_token (全局唯一标识的token)
+ * @param   s_tree  (token对应的资源权限树)
+ * @return  成功返回0
+ *********************************************************************/
+int casClient::set_mtree(string s_token,string s_tree)
+{
+	m_tree.insert(pair<string,string>(s_token,s_tree));
+	m_info((char*)"set_mtree success");
+	return 0;
+}
+
+/**********************************************************************
+ * @brief   保存tokrn对应用户列表
+ * @param 	s_token    (全局唯一标识的token)
+ * @param   s_username (token对应的用户名)
+ * @return  成功返回0
+ *********************************************************************/
+int casClient::set_muser(string s_token,string s_user)
+{
+	m_user.insert(pair<string,string>(s_token,s_user));
+	m_info((char*)"set_muser success");
+	return 0;
+}
+
+/**********************************************************************
+ * @brief   保存tokrn对应用户类型列表
+ * @param 	s_token    (全局唯一标识的token)
+ * @param   s_user_type(token对应的用户类型)
+ * @return  成功返回0
+ *********************************************************************/
+int casClient::set_muser_type(string s_token,string s_user_type)
+{
+
+    m_user_type.insert(pair<string,string>(s_token,s_user_type));
+    m_info((char*)"m_user_type success");
+    return 0;
+}
+
+/**********************************************************************
+ * @brief   在操作超时时候删除user map里面记录
+ * @param 	s_token 	(全局唯一标识的token)
+ * @return  成功返回0，失败返回-1
+ *********************************************************************/
+int casClient::del_muser(string s_token)
+{
+
+	map<string, string >::iterator l_it;
+	l_it = m_user.find(s_token);
+
+    if(l_it != m_user.end())
+    {
+    	m_user.erase(l_it);
+    	m_info((char*)"del_muser success");
+    	return 0;
+    }
+    m_warn((char*)"del_muser fail");
+    return -1;
+}
+
+/**********************************************************************
+ * @brief   在操作超时时候删除tree map里面记录
+ * @param 	s_token   (全局唯一标识的token)
+ * @return  成功返回0，失败返回-1
+ *********************************************************************/
+int casClient::del_mtree(string s_token)
+{
+
+	map<string ,string >::iterator l_it;
+	l_it = m_tree.find(s_token);
+
+    if(l_it != m_tree.end())
+    {
+    	m_tree.erase(l_it);
+    	m_info((char*)"del_mtree success");
+    	return 0;
+    }
+    m_warn((char*)"del_mtree fail");
+    return -1;
+}
+
+/**********************************************************************
+ * @brief   在操作超时时候删除lasttime map里面记录
+ * @param 	s_token   (全局唯一标识的token)
+ * @return  成功返回0，失败返回-1
+ *********************************************************************/
+int casClient::del_last_time(string s_token)
+{
+
+	map<string ,string >::iterator l_it;
+	l_it = m_last_time.find(s_token);
+
+    if(l_it != m_last_time.end())
+    {
+    	m_last_time.erase(l_it);
+    	m_info((char*)"del_last_time success");
+    	return 0;
+    }
+    m_warn((char*)"del_last_time fail");
+    return -1;
+}
+
+/**********************************************************************
+ * @brief   在操作超时时候删除lasttime map里面记录
+ * @param 	s_token (全局唯一标识的token)
+ * @return  成功返回0，失败返回-1
+ *********************************************************************/
+int casClient::del_muser_type(string s_token)
+{
+
+	map<string ,string >::iterator l_it;
+	l_it = m_user_type.find(s_token);
+
+    if(l_it != m_user_type.end())
+    {
+    	m_user_type.erase(l_it);
+    	m_info((char*)"del_muser_type success");
+    	return 0;
+    }
+    m_warn((char*)"del_muser_type fail");
+    return -1;
+}
+
+/**********************************************************************
+ * @brief   在map内存满时候删除 map里面记录
+ * @param 
+ * @return  成功返回0,失败返回-1
+ *********************************************************************/
+int casClient::m_pop()
+{
+	for (int index = 0; index < USER_MAX_SIZE/10; ++index)
+	{
+		string s_token;
+		s_token = l_token.back();
+		l_token.pop_back();
+		if(-1 == this->del_muser(s_token))
+		{
+			return -1;
+		}
+
+		if(-1 == this->del_mtree(s_token))
+		{
+			return -1;
+		}
+
+		if(-1 == this->del_last_time(s_token))
+		{
+		 	return -1;
+		}
+
+		if(-1 == this->del_muser_type(s_token))
+		{
+			return -1;
+		}
+	}
+	m_info((char*)"m_pop success");
+	return 0;
+}
+
+/**********************************************************************
+ * @brief   刷新redis集群对应token的ttl;
+ * @param 	s_token(全局唯一标识的token)
+ * @return 	成功返回0，失败返回-1代表没有找到或者连接失败
+ ********************************************************************/
+int casClient::expire(string s_token)
+{
+	//拼凑redis命令
+	char c_szcommand1[100] = {0};
+	snprintf(c_szcommand1,sizeof(c_szcommand1),"EXPIRE %s %d",s_token.c_str(),REDIS_EFFECTIVE_TIME);
+	m_info(c_szcommand1);
+
+	redisReply *reply1;
+
+	//执行获取返回结构体
+	reply1 = (redisReply*)redisClusterCommand(m_pctx,c_szcommand1);
+	if (reply1 == NULL)
+	{
+		m_warn((char*)"reply1 == NULL");
+		return -1;
+	}
+	if(reply1->type == REDIS_REPLY_ERROR)
+	{
+		m_warn(reply1->str);
+		freeReplyObject(reply1);
+		return -1;
+	}
+	freeReplyObject(reply1);
+	return 0;
+}
+
+/**********************************************************************
+ * @brief   redis集群里面toen对应信息存储到map当map里面存储数量超过删除map最后一个元素；
+ * @param 	s_token(全局唯一标识的token)
+ * @return 	成功返回0，失败返回-1代表没有找到或者连接失败
+ ********************************************************************/
+int casClient::lrange(string s_token)
+{
+	//拼凑redis命令
+        char c_szcommand[100] = {0};
+	snprintf(c_szcommand,sizeof(c_szcommand),"lrange %s 0 -1",s_token.c_str());
+
+        m_info(c_szcommand);
+
+	redisReply *reply;
+	//执行获取返回结构体
+	reply = (redisReply*)redisClusterCommand(m_pctx,c_szcommand);
+	if (reply == NULL)
+	{
+		m_warn((char*)"reply == NULL");
+		this->reconnect();
+		return -1;
+	}
+
+	if(reply->type == REDIS_REPLY_ERROR||reply->elements==0)
+	{
+		m_warn((char *)"reply->str");
+		freeReplyObject(reply);
+		return -1;
+	}
+
+
+	if (l_token.size()>USER_MAX_SIZE)
+	{
+		if(-1 == this->m_pop())
+		{
+			m_error((char*)"m_pop error");
+			return -1;
+		}
+	}
+
+	//将查询到的数据存储到内存
+	l_token.push_back(s_token);
+	string s_user_type = reply->element[0]->str;
+	this->set_muser_type(s_token,s_user_type);
+	string s_user = reply->element[1]->str;
+	this->set_muser(s_token,s_user);
+	string s_tree = reply->element[2]->str;
+	this->set_mtree(s_token,s_tree);
+	freeReplyObject(reply);
+	m_info((char*)"lrang success");
+	return 0;
+}
+
+/**********************************************************************
+ * @brief   判断用户是否有操作的权限
+ * @param 	s_token  (全局唯一标识的token,根据token可以确定一组数据)
+ * @param 	s_uri    (需要判断权限的资源uri)
+ * @param 	s_operation (需要判断权限的具体操作)
+ * @return 	成功返回0，失败返回-1代表没有找到或者连接失败
+ ********************************************************************/
+int casClient::is_effective(string s_token, string s_tree,string s_username, string s_uri, string s_operation)
+{
+	map<string ,string >::iterator l_it;
+    l_it = m_user.find(s_token);
+    if(l_it == m_user.end())
+    {
+    	return -1;
+    	m_warn((char*)"m_user no token");
+    }
+
+    if (l_it->second != s_username)
+    {
+    	m_warn((char*)"username no equal");
+    	return -1;
+    }
+
+	Json::Reader reader;
+	Json::Value resource;
+	// reader将Json字符串解析到resource，resource将包含Json里所有子元素
+	if (s_tree.c_str() == NULL)
+	{
+		if(-1 == this->lrange(s_token))
+    	{
+			m_warn((char*)"redis lrang return -1");
+			return -1;
+    	}
+    	map<string ,string >::iterator l_it1;
+    	l_it1 = m_tree.find(s_token);
+    	s_tree = l_it1->second;
+	}
+	if (reader.parse(s_tree.c_str(), resource))
+	{
+
+		if(0 == this->is_uri(resource,s_uri,s_operation))
+		{
+			m_info((char*)"is_effective success");
+			return 0;
+		}
+	}
+	m_warn((char*)"json analysis stree fail");
+  	return -1;
+}
+
+/**********************************************************************
+ * @brief   使用递归遍历查找用户是否有这个权限
+ * @param 	resource  (json解析出来的children数据)
+ * @param 	s_uri 	  (需要判断权限的资源uri)
+ * @param 	s_operation (需要判断权限的具体操作)
+ * @return 	成功返回0，失败返回-1代表没有权限
+ ********************************************************************/
+int casClient::is_uri(Json::Value resource, string s_uri, string s_operation)
+{
+	for (unsigned int index = 0; index < resource["children"].size(); ++index)
+	{
+		string resourceUri;
+		Json::Value val_image = resource["children"][index];
+		resourceUri = val_image["resourceUri"].asString();
+		if (resourceUri == s_uri)
+		{
+			string resourceOperation;
+			resourceOperation = val_image["resourceOperation"].asString();
+			if (resourceOperation == s_operation)
+			{
+				return 0;
+			}
+		}
+
+		if (val_image["children"].size())
+		{
+			if(0==this->is_uri(val_image,s_uri,s_operation))
+			{
+				return 0;
+			}
+		}
+
+	}//for
+	return -1;
+}
+
+/**********************************************************************
+ * @brief   对外开放认证接口
+ * @param 	s_token （token一个用户登录一次生成的唯一的标识）
+ * @param 	s_username（进行认证的用户名）
+ * @param 	s_uri（用户要操作的uri）
+ * @param   s_operation（用户具体操作）
+ * @return 	根据enmu返回{OPERATE_ERROR：lrange执行出错，NO_Effective：
+ * 	is_effective认证没过，OVERTIME：太久没操作权限失效，SUCCESS：成功}
+ ********************************************************************/
+char* casClient::authentication(string s_token, string s_username, string s_uri, string s_operation)
+{
+
+
+    if(this->m_result == NULL)
+        m_warn((char*)"m_result is NULL!");
+    memset(m_result,0,500);
+    //判断输入数据的合法性
+    if (s_token.empty() || s_uri.empty() || s_operation.empty() ||s_username.empty())
+    {
+	m_warn((char*)"function arguments is empty");
+	snprintf(m_result,50,"{'result':'CAS_INVALID_ARGUMENT'}");
+	return m_result;
+    }
+    
+    //判断本地内存里面是否有这个token
+    map<string ,string >::iterator l_it;
+    l_it = m_tree.find(s_token);
+
+
+    //如果没有这个token便去redis数据库里面查询
+    if(l_it == m_tree.end())
+    {
+    	this->set_last_time(s_token);
+    	if(-1 == this->lrange(s_token))
+    	{
+    		snprintf(m_result,50,"{'result':'CAS_OPERATE_ERROR'}");
+			m_warn((char*)"redis lrang return -1");
+			return m_result;
+    	}
+    	map<string ,string >::iterator l_it1;
+    	l_it1 = m_tree.find(s_token);
+
+    	if(-1 == this->is_effective(s_token, l_it1->second, s_username, s_uri, s_operation))
+		{
+			snprintf(m_result,50,"{'result':'CAS_NO_Effective'}");
+			m_warn((char*)"is_effective fail");
+			return m_result;
+		}
+    }
+    else                  //本地内存有这个token
+    {
+    	time_t rawtime;
+    	time_t rawtime1;
+    	int 	time_diff;
+		time (&rawtime);
+		map<string ,string >::iterator l_it1;
+		l_it1=m_last_time.find(s_token);
+		if(l_it1==m_last_time.end())
+		{
+			m_warn((char *)"find time error");
+			return ((char *)"{'result':'CAS_NO_Effective'}");
+		}
+		rawtime1 = this->str_to_t(l_it1->second);
+		time_diff = rawtime - rawtime1;
+
+		//判断用户最后操作操作时间是否在本地验证规定时间内
+		if (time_diff < MEMORY_TIME_LIMIT)
+		{
+			if(-1 == this->is_effective(s_token, l_it->second, s_username, s_uri, s_operation))
+			{
+				snprintf(m_result,50,"{'result':'CAS_NO_Effective'}");
+				m_warn((char*)"is_effective fail");
+				return m_result;
+			}
+		}
+		else
+		{
+			
+
+			m_info((char *)"time_diff = %d",time_diff);
+			//判断用户最后操作操作时间是否在数据库验证规定时间内
+			if (time_diff < REDIS_TIME_LIMIT)
+			{
+				if(-1 == this->lrange(s_token))
+    			{
+    				snprintf(m_result,50,"{'result':'CAS_OPERATE_ERROR'}");
+					m_warn((char*)"redis lrange return -1");
+					return m_result;
+    			}
+
+    			map<string ,string >::iterator l_it2;
+    			l_it2 = m_tree.find(s_token);
+
+    			if(-1 == this->is_effective(s_token, l_it2->second, s_username, s_uri, s_operation))
+				{
+					snprintf(m_result,50,"{'result':'CAS_NO_Effective'}");
+					m_warn((char*)"is_effective fail");
+					return m_result;
+				}
+
+			}//if (time_diff < REDIS_TIME_LIMIT)
+			else            //用户登录超时
+			{
+				this->del_muser(s_token);
+				this->del_mtree(s_token);
+				this->del_last_time(s_token);
+				this->del_muser_type(s_token);
+				snprintf(m_result,50,"{'result':'CAS_OVERTIME'}");
+				m_warn((char*)"user connect OVERTIME");
+				return m_result;
+			}
+		}//if (time_diff < MEMORY_TIME_LIMIT)
+		this->set_last_time(s_token);
+		this->expire(s_token);
+    }//if(l_it == m_tree.end())
+    map<string ,string >::iterator l_it1;
+    l_it1 = m_user_type.find(s_token);
+    snprintf(m_result,50,"{'result':'CAS_SUCCESS','user_type':'%s'}", l_it1->second.c_str());
+    m_info((char*)"authentication success");
+    return m_result;
+}
+
+
+
